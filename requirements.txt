@@ -3,6 +3,7 @@ pandas
 numpy
 yfinance
 requests
-FinMind
 html5lib
 lxml
+tqdm
+FinMind
