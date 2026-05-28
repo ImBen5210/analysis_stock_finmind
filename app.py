@@ -7,11 +7,12 @@ from io import StringIO
 from datetime import datetime, timedelta
 import warnings
 import time
+from FinMind.data import DataLoader
 
 warnings.filterwarnings('ignore')
 
 # 網頁基本設定
-st.set_page_config(page_title="AI動能妖股雷達 (極速過濾版)", page_icon="🚀", layout="wide")
+st.set_page_config(page_title="AI動能妖股雷達 (機構升級版)", page_icon="🚀", layout="wide")
 
 # ==========================================
 # 核心功能模組
@@ -44,7 +45,7 @@ def get_tw_stock_list():
 def get_sp500_tickers():
     try:
         url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
-        headers = {'User-Agent': 'Mozilla/5.0'}
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0'}
         res = requests.get(url, headers=headers, timeout=15)
         df = pd.read_html(StringIO(res.text))[0]
         tickers = df['Symbol'].str.replace('.', '-').tolist()
@@ -54,43 +55,29 @@ def get_sp500_tickers():
     except Exception: 
         return {}
 
-def check_market(symbol):
+def check_market(symbol, market_type="台股", token=""):
     try:
-        data = yf.download(symbol, period="50d", progress=False)
-        close = float(data['Close'].iloc[-1].iloc[0]) if isinstance(data['Close'].iloc[-1], pd.Series) else float(data['Close'].iloc[-1])
-        ma20 = float(data['Close'].rolling(20).mean().iloc[-1].iloc[0]) if isinstance(data['Close'].rolling(20).mean().iloc[-1], pd.Series) else float(data['Close'].rolling(20).mean().iloc[-1])
+        if market_type == "台股":
+            dl = DataLoader()
+            if token: dl.login_by_token(api_token=token)
+            start_date_str = (datetime.now() - timedelta(days=60)).strftime("%Y-%m-%d")
+            data = dl.taiwan_stock_daily(stock_id="^TWII", start_date=start_date_str)
+            close_series = data['close']
+        else:
+            data = yf.download(symbol, period="50d", progress=False)
+            close_series = data['Close']
+            
+        close = float(close_series.iloc[-1])
+        ma20 = float(close_series.rolling(20).mean().iloc[-1])
         return close >= ma20, close, ma20
-    except Exception:
+    except Exception as e:
+        print(f"大盤檢查失敗: {e}")
         return True, 0, 0
 
-# 🌟 核心升級：利用政府 Open API 進行初階量能過濾
-def get_active_tw_tickers(vol_limit):
-    active_tickers = set()
-    try:
-        # 抓取上市今日行情
-        twse_res = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", timeout=10).json()
-        for row in twse_res:
-            try:
-                vol = float(row.get('TradeVolume', 0)) / 1000 # 轉換為張
-                if vol >= vol_limit:
-                    active_tickers.add(f"{row['Code']}.TW")
-            except: pass
-            
-        # 抓取上櫃今日行情
-        tpex_res = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes", timeout=10).json()
-        for row in tpex_res:
-            try:
-                vol = float(row.get('TradingVolume', 0)) / 1000 # 轉換為張
-                if vol >= vol_limit:
-                    active_tickers.add(f"{row['SecuritiesCompanyCode']}.TWO")
-            except: pass
-    except Exception as e:
-        print(f"Open API 抓取失敗: {e}")
-    return active_tickers
-
+# 將計算邏輯獨立，讓 yfinance 和 FinMind 共用
 def process_stock(ticker, df, stock_dict, market_name, vol_label, mkt_ret_20, records):
     try:
-        if df is None or df.empty or len(df) < 120: return 
+        if df.empty or len(df) < 120: return 
         df = df.dropna()
         
         close = df['Close']
@@ -100,18 +87,25 @@ def process_stock(ticker, df, stock_dict, market_name, vol_label, mkt_ret_20, re
         open_p = df['Open']
         
         c_close = float(close.iloc[-1])
+        c_close_prev = float(close.iloc[-2]) # 📊 新增：抓取昨日收盤價
         c_open = float(open_p.iloc[-1])
         c_high = float(high.iloc[-1])
         c_low = float(low.iloc[-1])
         
+        # 📊 新增：計算今日真實漲跌幅
+        daily_change = ((c_close / c_close_prev) - 1) * 100
+        
+        # 避雷針過濾
         k_len = c_high - c_low
         if k_len > 0:
             upper_shadow = (c_high - max(c_open, c_close)) / k_len
             if upper_shadow > 0.5: return 
                 
+        # 爆量倍數
         vol_20_mean = float(vol.tail(20).mean())
         vol_ratio = float(vol.iloc[-1]) / (vol_20_mean + 1e-9)
 
+        # 爆量黑K過濾
         is_black_k = c_close < c_open
         if vol_ratio > 2.5 and is_black_k: return 
         
@@ -120,12 +114,13 @@ def process_stock(ticker, df, stock_dict, market_name, vol_label, mkt_ret_20, re
         roll_60 = close.rolling(60)
         
         ma5 = float(roll_5.mean().iloc[-1])
-        if c_close < ma5: return  
+        if c_close < ma5: return  # 必須站在 5MA 之上
         
         ma5_bias = ((c_close - ma5) / (ma5 + 1e-9)) * 100
         ma20 = float(roll_20.mean().iloc[-1])
         ma60 = float(roll_60.mean().iloc[-1])
         
+        # 流動性計算 (FinMind 台股回傳的是「股數」，需要除以 1000 變為「張」)
         if "台股" in market_name:
             avg_vol = float((vol.tail(5).mean()) / 1000)
         else:
@@ -155,6 +150,7 @@ def process_stock(ticker, df, stock_dict, market_name, vol_label, mkt_ret_20, re
             '股名': stock_dict[ticker]['name'],
             '板塊產業': stock_dict[ticker]['sector'],
             '收盤價': round(c_close, 2),
+            '今日漲跌(%)': round(daily_change, 2), # 📊 新增此欄位
             'MA5 (防守線)': round(ma5, 2),
             '5MA乖離率(%)': round(ma5_bias, 2),
             '爆量倍數': round(vol_ratio, 2),
@@ -166,62 +162,27 @@ def process_stock(ticker, df, stock_dict, market_name, vol_label, mkt_ret_20, re
             'F_Hist_Vol': hist_vol, 'F_BB_Width': bb_width, 'F_Trend_Strength': trend_str, 
             'F_P_to_MA20': p_to_ma20, 'F_P_to_BBUpper': p_to_bbupper, 'F_ROC_10': roc_10
         })
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"處理 {ticker} 發生錯誤: {e}")
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def fetch_and_calculate_features(market_name, token="", user_vol_limit=1000):
+def fetch_and_calculate_features(market_name, token=""):
     records = []
     start_date_str = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
-    api_limit_hit = False
 
     if "台股" in market_name:
         stock_dict = get_tw_stock_list()
         vol_label = "5日均量(張)"
+        dl = DataLoader()
+        if token: dl.login_by_token(api_token=token)
+        
         try:
-            mkt_data = yf.download('^TWII', period="1y", auto_adjust=True, progress=False)['Close']
+            mkt_df = dl.taiwan_stock_daily(stock_id='^TWII', start_date=start_date_str)
+            mkt_data = mkt_df['close']
             mkt_ret_20 = float((mkt_data.iloc[-1] / mkt_data.iloc[-21]) - 1) * 100
         except:
             mkt_ret_20 = 0.0
-            
-        if not stock_dict: return pd.DataFrame(), vol_label, False
-        
-        # 🎯 初階過濾：先抓 Open API，只把有量的股票名單留下來
-        active_tickers = get_active_tw_tickers(user_vol_limit)
-        
-        # 如果 Open API 失敗，才 fallback 使用全部名單
-        target_list = [t for t in stock_dict.keys() if t in active_tickers] if active_tickers else list(stock_dict.keys())
-        
-        for ticker in target_list:
-            if api_limit_hit: break
-            stock_id = ticker.replace(".TW", "").replace(".TWO", "")
-            url = "https://api.finmindtrade.com/api/v4/data"
-            params = {"dataset": "TaiwanStockPrice", "data_id": stock_id, "start_date": start_date_str}
-            if token: params["token"] = token
-            
-            try:
-                time.sleep(0.05) 
-                res = requests.get(url, params=params, timeout=10)
-                data = res.json()
-                
-                if data.get("msg") != "success":
-                    if "limit" in str(data.get("msg")).lower():
-                        api_limit_hit = True
-                    continue
-                    
-                df_data = data.get("data", [])
-                if not df_data: continue
-                
-                df = pd.DataFrame(df_data)
-                df = df.rename(columns={"open": "Open", "max": "High", "min": "Low", "close": "Close", "Trading_Volume": "Volume"})
-                df['Date'] = pd.to_datetime(df['date'])
-                df = df.set_index('Date')
-                
-                process_stock(ticker, df, stock_dict, market_name, vol_label, mkt_ret_20, records)
-            except Exception:
-                continue
     else:
-        # 美股邏輯維持不變
         stock_dict = get_sp500_tickers()
         vol_label = "5日均量(M)"
         try:
@@ -230,26 +191,51 @@ def fetch_and_calculate_features(market_name, token="", user_vol_limit=1000):
         except:
             mkt_ret_20 = 0.0
 
-        if not stock_dict: return pd.DataFrame(), vol_label, False
+    if not stock_dict:
+        return pd.DataFrame(), vol_label
 
-        all_tickers = list(stock_dict.keys())
-        for i in range(0, len(all_tickers), 50):
-            batch = all_tickers[i:i+50]
+    all_tickers = list(stock_dict.keys())
+    batch_size = 50
+    
+    for i in range(0, len(all_tickers), batch_size):
+        batch = all_tickers[i:i+batch_size]
+        
+        if "台股" in market_name:
+            # 🚀 FinMind 引擎
+            batch_ids = [t.replace(".TW", "").replace(".TWO", "") for t in batch]
+            try:
+                time.sleep(0.5) # 微幅暫停，維持連線穩定
+                df_batch = dl.taiwan_stock_daily(stock_id_list=batch_ids, start_date=start_date_str, use_async=True)
+                
+                if df_batch is None or df_batch.empty: continue
+                
+                for stock_id, df in df_batch.groupby('stock_id'):
+                    orig_ticker = f"{stock_id}.TW" if f"{stock_id}.TW" in stock_dict else f"{stock_id}.TWO"
+                    df = df.sort_values('date').reset_index(drop=True)
+                    # 統一欄位名稱，相容原本的計算邏輯
+                    df = df.rename(columns={"open": "Open", "max": "High", "min": "Low", "close": "Close", "Trading_Volume": "Volume"})
+                    process_stock(orig_ticker, df, stock_dict, market_name, vol_label, mkt_ret_20, records)
+            except Exception as e:
+                print(f"FinMind 抓取失敗: {e}")
+                continue
+        else:
+            # 🚀 yfinance 引擎 (美股)
             try:
                 time.sleep(1)
                 data = yf.download(batch, period="1y", interval="1d", group_by='ticker', auto_adjust=True, progress=False, threads=True)
                 for ticker in batch:
                     df = data[ticker] if len(batch) > 1 else data
                     process_stock(ticker, df, stock_dict, market_name, vol_label, mkt_ret_20, records)
-            except Exception:
+            except Exception as e:
+                print(f"yfinance 抓取失敗: {e}")
                 continue
                 
-    return pd.DataFrame(records), vol_label, api_limit_hit
+    return pd.DataFrame(records), vol_label
 
 # ==========================================
 # 網頁介面設計
 # ==========================================
-st.title("🚀 AI 動能妖股雷達 (極速過濾版)")
+st.title("🚀 AI 動能妖股雷達 (雙引擎升級版)")
 st.markdown("內建【相對強度 RS】與【半年新高突破】，精準狙擊無懼大盤的真正領頭羊。")
 
 st.sidebar.header("⚙️ 雷達設定")
@@ -257,7 +243,7 @@ market = st.sidebar.radio("選擇掃描市場", ["🇹🇼 台股 (API: FinMind)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔑 台灣 API 授權")
-st.sidebar.markdown("雖然已內建智慧量能過濾，但若您將標準設得非常低，仍建議填寫[免費註冊的 Token](https://finmindtrade.com/) 以策安全。")
+st.sidebar.markdown("FinMind 訪客一小時限制掃描 300 次，若要全台股掃描，請填入[免費註冊的 Token](https://finmindtrade.com/)。")
 finmind_token = st.sidebar.text_input("FinMind API Token", type="password")
 
 st.sidebar.markdown("---")
@@ -266,28 +252,33 @@ user_vol_limit = st.sidebar.number_input("最小均量限制 (台:張 / 美:百�
 user_bias_limit = st.sidebar.slider("乖離率扣分門檻 (%)", min_value=1, max_value=15, value=5)
 user_penalty = st.sidebar.number_input("超過門檻每 1% 扣幾分?", min_value=1, max_value=20, value=5, step=1)
 
+st.sidebar.markdown("---")
+st.sidebar.info("💡 **教練實戰紀律提醒**\n\n進場後若收盤跌破 5MA，請無條件執行停損。")
+
 if st.button("開始全面掃描", type="primary"):
-    is_bull, idx_close, idx_ma = check_market("^TWII" if "台股" in market else "^GSPC")
+    if "台股" in market:
+        is_bull, idx_close, idx_ma = check_market("^TWII", "台股", finmind_token)
+    else:
+        is_bull, idx_close, idx_ma = check_market("^GSPC", "美股", "")
 
     if is_bull:
         st.success(f"🟢 【大盤偏多】目前指數 ({idx_close:.2f}) 站上月線 ({idx_ma:.2f})，適合動能策略！")
     else:
         st.error(f"🔴 【大盤偏空】目前指數 ({idx_close:.2f}) 跌破月線 ({idx_ma:.2f})，極易假突破，建議空手觀望！")
 
-    with st.status(f"🔍 啟動 {market} 運算中 (已開啟智慧量能過濾，預計 15~30 秒完成)...", expanded=True) as status:
-        # 將 user_vol_limit 傳入，先過濾再掃描
-        df_all, vol_label, api_limit_hit = fetch_and_calculate_features(market, finmind_token, user_vol_limit)
+    with st.status(f"🔍 啟動 {market} 運算中 (包含 RS 大盤比對，約需 1-2 分鐘)...", expanded=True) as status:
+        df_all, vol_label = fetch_and_calculate_features(market, finmind_token)
         
         if df_all.empty:
             status.update(label="❌ 掃描失敗或無符合標的", state="error", expanded=False)
-            st.error("目前無法取得數據。如果尚未填寫 Token，可能是額度已耗盡，請稍候再試。")
+            st.error("目前無法取得數據。如果是掃描台股，可能是超過了 FinMind 的未登入次數限制，請在左側輸入 Token。")
             st.stop()
             
         df_records = df_all[df_all['Avg_Vol'] >= user_vol_limit].copy()
         
         if df_records.empty:
             status.update(label="❌ 無符合條件的標的", state="error", expanded=False)
-            st.warning(f"目前沒有任何標的符合條件，請嘗試調低標準。")
+            st.warning(f"目前沒有任何標的的成交量大於 {user_vol_limit}，請嘗試調低標準。")
             st.stop()
 
         features = ['F_RS', 'F_Vol_Ratio', 'F_Hist_Vol', 'F_120_High', 'F_BB_Width', 'F_Trend_Strength', 'F_P_to_MA20', 'F_P_to_BBUpper', 'F_ROC_10']
@@ -304,17 +295,16 @@ if st.button("開始全面掃描", type="primary"):
         
         top20 = df_records.sort_values(by='AI 總分', ascending=False).head(20)
         
-        if api_limit_hit:
-            status.update(label="⚠️ 已達 API 額度上限，結算目前已掃描名單！", state="complete", expanded=False)
-            st.toast("⚠️ FinMind 額度已滿，已為您結算目前掃描到的股票。")
-        else:
-            status.update(label="✅ 掃描與運算完成！", state="complete", expanded=False)
+        status.update(label="✅ 掃描與運算完成！", state="complete", expanded=False)
 
-    display_cols = ['ID', '股名', '板塊產業', '收盤價', 'MA5 (防守線)', '5MA乖離率(%)', '爆量倍數', 'RS相對強度', '120日高距離(%)', vol_label, 'AI 總分']
+    # 📊 升級：在這裡將 `今日漲跌(%)` 插入顯示列表中
+    display_cols = ['ID', '股名', '板塊產業', '收盤價', '今日漲跌(%)', 'MA5 (防守線)', '5MA乖離率(%)', '爆量倍數', 'RS相對強度', '120日高距離(%)', vol_label, 'AI 總分']
     st.dataframe(top20[display_cols], width="stretch", hide_index=True)
     
+    st.info(f"💡 **乖離率實戰指南**：🟢 0% - 3% 首選試單 ｜ 🟡 3% - {user_bias_limit}% 注意追高｜ 🔴 >{user_bias_limit}% 已自動扣分處罰。")
+    
     st.markdown("---")
-    st.markdown("### 🔥 資金匯聚熱區 (前 20 名板塊統計)")
+    st.markdown("### 🔥 今日資金匯聚熱區 (前 20 名板塊統計)")
     sector_counts = top20['板塊產業'].value_counts().reset_index()
     sector_counts.columns = ['板塊產業', '進榜檔數']
     
@@ -328,6 +318,6 @@ if st.button("開始全面掃描", type="primary"):
     st.download_button(
         label="📥 下載完整 CSV 報表",
         data=csv,
-        file_name=f"Radar_Top20_API_{datetime.now().strftime('%Y%m%d')}.csv",
+        file_name=f"Radar_Top20_Pro_{datetime.now().strftime('%Y%m%d')}.csv",
         mime="text/csv",
     )
