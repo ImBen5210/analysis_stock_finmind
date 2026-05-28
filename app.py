@@ -87,9 +87,13 @@ def process_stock(ticker, df, stock_dict, market_name, vol_label, mkt_ret_20, re
         open_p = df['Open']
         
         c_close = float(close.iloc[-1])
+        c_close_prev = float(close.iloc[-2]) # 📊 新增：抓取昨日收盤價
         c_open = float(open_p.iloc[-1])
         c_high = float(high.iloc[-1])
         c_low = float(low.iloc[-1])
+        
+        # 📊 新增：計算今日真實漲跌幅
+        daily_change = ((c_close / c_close_prev) - 1) * 100
         
         # 避雷針過濾
         k_len = c_high - c_low
@@ -146,6 +150,7 @@ def process_stock(ticker, df, stock_dict, market_name, vol_label, mkt_ret_20, re
             '股名': stock_dict[ticker]['name'],
             '板塊產業': stock_dict[ticker]['sector'],
             '收盤價': round(c_close, 2),
+            '今日漲跌(%)': round(daily_change, 2), # 📊 新增此欄位
             'MA5 (防守線)': round(ma5, 2),
             '5MA乖離率(%)': round(ma5_bias, 2),
             '爆量倍數': round(vol_ratio, 2),
@@ -292,7 +297,8 @@ if st.button("開始全面掃描", type="primary"):
         
         status.update(label="✅ 掃描與運算完成！", state="complete", expanded=False)
 
-    display_cols = ['ID', '股名', '板塊產業', '收盤價', 'MA5 (防守線)', '5MA乖離率(%)', '爆量倍數', 'RS相對強度', '120日高距離(%)', vol_label, 'AI 總分']
+    # 📊 升級：在這裡將 `今日漲跌(%)` 插入顯示列表中
+    display_cols = ['ID', '股名', '板塊產業', '收盤價', '今日漲跌(%)', 'MA5 (防守線)', '5MA乖離率(%)', '爆量倍數', 'RS相對強度', '120日高距離(%)', vol_label, 'AI 總分']
     st.dataframe(top20[display_cols], width="stretch", hide_index=True)
     
     st.info(f"💡 **乖離率實戰指南**：🟢 0% - 3% 首選試單 ｜ 🟡 3% - {user_bias_limit}% 注意追高｜ 🔴 >{user_bias_limit}% 已自動扣分處罰。")
