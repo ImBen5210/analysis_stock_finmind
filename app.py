@@ -55,17 +55,13 @@ def get_sp500_tickers():
     except Exception: 
         return {}
 
-def check_market(symbol, market_type="台股", token=""):
+def check_market(symbol):
     try:
-        if market_type == "台股":
-            dl = DataLoader()
-            if token: dl.login_by_token(api_token=token)
-            start_date_str = (datetime.now() - timedelta(days=60)).strftime("%Y-%m-%d")
-            data = dl.taiwan_stock_daily(stock_id="^TWII", start_date=start_date_str)
-            close_series = data['close']
-        else:
-            data = yf.download(symbol, period="50d", progress=False)
-            close_series = data['Close']
+        # 🛠️ 統一用 yfinance 抓大盤，穩定、免費、免 Token，相容所有環境
+        data = yf.download(symbol, period="75d", auto_adjust=True, progress=False)
+        close_series = data['Close']
+        if isinstance(close_series, pd.DataFrame):
+            close_series = close_series.iloc[:, 0]
             
         close = float(close_series.iloc[-1])
         ma20 = float(close_series.rolling(20).mean().iloc[-1])
@@ -74,7 +70,7 @@ def check_market(symbol, market_type="台股", token=""):
         print(f"大盤檢查失敗: {e}")
         return True, 0, 0
 
-# 將計算邏輯獨立，讓 yfinance 和 FinMind 共用
+# 計算邏輯
 def process_stock(ticker, df, stock_dict, market_name, vol_label, mkt_ret_20, records):
     try:
         if df.empty or len(df) < 120: return 
@@ -87,12 +83,12 @@ def process_stock(ticker, df, stock_dict, market_name, vol_label, mkt_ret_20, re
         open_p = df['Open']
         
         c_close = float(close.iloc[-1])
-        c_close_prev = float(close.iloc[-2]) # 📊 新增：抓取昨日收盤價
+        c_close_prev = float(close.iloc[-2]) 
         c_open = float(open_p.iloc[-1])
         c_high = float(high.iloc[-1])
         c_low = float(low.iloc[-1])
         
-        # 📊 新增：計算今日真實漲跌幅
+        # 📊 計算今日真實漲跌幅
         daily_change = ((c_close / c_close_prev) - 1) * 100
         
         # 避雷針過濾
@@ -114,13 +110,12 @@ def process_stock(ticker, df, stock_dict, market_name, vol_label, mkt_ret_20, re
         roll_60 = close.rolling(60)
         
         ma5 = float(roll_5.mean().iloc[-1])
-        if c_close < ma5: return  # 必須站在 5MA 之上
+        if c_close < ma5: return  
         
         ma5_bias = ((c_close - ma5) / (ma5 + 1e-9)) * 100
         ma20 = float(roll_20.mean().iloc[-1])
         ma60 = float(roll_60.mean().iloc[-1])
         
-        # 流動性計算 (FinMind 台股回傳的是「股數」，需要除以 1000 變為「張」)
         if "台股" in market_name:
             avg_vol = float((vol.tail(5).mean()) / 1000)
         else:
@@ -150,7 +145,7 @@ def process_stock(ticker, df, stock_dict, market_name, vol_label, mkt_ret_20, re
             '股名': stock_dict[ticker]['name'],
             '板塊產業': stock_dict[ticker]['sector'],
             '收盤價': round(c_close, 2),
-            '今日漲跌(%)': round(daily_change, 2), # 📊 新增此欄位
+            '今日漲跌(%)': round(daily_change, 2), 
             'MA5 (防守線)': round(ma5, 2),
             '5MA乖離率(%)': round(ma5_bias, 2),
             '爆量倍數': round(vol_ratio, 2),
@@ -175,24 +170,23 @@ def fetch_and_calculate_features(market_name, token=""):
         vol_label = "5日均量(張)"
         dl = DataLoader()
         if token: dl.login_by_token(api_token=token)
-        
-        try:
-            mkt_df = dl.taiwan_stock_daily(stock_id='^TWII', start_date=start_date_str)
-            mkt_data = mkt_df['close']
-            mkt_ret_20 = float((mkt_data.iloc[-1] / mkt_data.iloc[-21]) - 1) * 100
-        except:
-            mkt_ret_20 = 0.0
+        market_ticker = "^TWII"
     else:
         stock_dict = get_sp500_tickers()
         vol_label = "5日均量(M)"
-        try:
-            mkt_data = yf.download('^GSPC', period="1y", auto_adjust=True, progress=False)['Close']
-            mkt_ret_20 = float((mkt_data.iloc[-1] / mkt_data.iloc[-21]) - 1) * 100
-        except:
-            mkt_ret_20 = 0.0
+        market_ticker = "^GSPC"
 
     if not stock_dict:
         return pd.DataFrame(), vol_label
+
+    # 🛠️ 統一用 yfinance 獲取精確的大盤基準報酬率，修正 RS 因子誤差
+    try:
+        mkt_df = yf.download(market_ticker, period="50d", auto_adjust=True, progress=False)
+        mkt_close = mkt_df['Close']
+        if isinstance(mkt_close, pd.DataFrame): mkt_close = mkt_close.iloc[:, 0]
+        mkt_ret_20 = float((mkt_close.iloc[-1] / mkt_close.iloc[-21]) - 1) * 100
+    except:
+        mkt_ret_20 = 0.0
 
     all_tickers = list(stock_dict.keys())
     batch_size = 50
@@ -201,27 +195,23 @@ def fetch_and_calculate_features(market_name, token=""):
         batch = all_tickers[i:i+batch_size]
         
         if "台股" in market_name:
-            # 🚀 FinMind 引擎
             batch_ids = [t.replace(".TW", "").replace(".TWO", "") for t in batch]
             try:
-                time.sleep(0.5) # 微幅暫停，維持連線穩定
+                time.sleep(0.3) 
                 df_batch = dl.taiwan_stock_daily(stock_id_list=batch_ids, start_date=start_date_str, use_async=True)
-                
                 if df_batch is None or df_batch.empty: continue
                 
                 for stock_id, df in df_batch.groupby('stock_id'):
                     orig_ticker = f"{stock_id}.TW" if f"{stock_id}.TW" in stock_dict else f"{stock_id}.TWO"
                     df = df.sort_values('date').reset_index(drop=True)
-                    # 統一欄位名稱，相容原本的計算邏輯
                     df = df.rename(columns={"open": "Open", "max": "High", "min": "Low", "close": "Close", "Trading_Volume": "Volume"})
                     process_stock(orig_ticker, df, stock_dict, market_name, vol_label, mkt_ret_20, records)
             except Exception as e:
                 print(f"FinMind 抓取失敗: {e}")
                 continue
         else:
-            # 🚀 yfinance 引擎 (美股)
             try:
-                time.sleep(1)
+                time.sleep(0.5)
                 data = yf.download(batch, period="1y", interval="1d", group_by='ticker', auto_adjust=True, progress=False, threads=True)
                 for ticker in batch:
                     df = data[ticker] if len(batch) > 1 else data
@@ -257,9 +247,9 @@ st.sidebar.info("💡 **教練實戰紀律提醒**\n\n進場後若收盤跌破 5
 
 if st.button("開始全面掃描", type="primary"):
     if "台股" in market:
-        is_bull, idx_close, idx_ma = check_market("^TWII", "台股", finmind_token)
+        is_bull, idx_close, idx_ma = check_market("^TWII")
     else:
-        is_bull, idx_close, idx_ma = check_market("^GSPC", "美股", "")
+        is_bull, idx_close, idx_ma = check_market("^GSPC")
 
     if is_bull:
         st.success(f"🟢 【大盤偏多】目前指數 ({idx_close:.2f}) 站上月線 ({idx_ma:.2f})，適合動能策略！")
@@ -297,7 +287,6 @@ if st.button("開始全面掃描", type="primary"):
         
         status.update(label="✅ 掃描與運算完成！", state="complete", expanded=False)
 
-    # 📊 升級：在這裡將 `今日漲跌(%)` 插入顯示列表中
     display_cols = ['ID', '股名', '板塊產業', '收盤價', '今日漲跌(%)', 'MA5 (防守線)', '5MA乖離率(%)', '爆量倍數', 'RS相對強度', '120日高距離(%)', vol_label, 'AI 總分']
     st.dataframe(top20[display_cols], width="stretch", hide_index=True)
     
